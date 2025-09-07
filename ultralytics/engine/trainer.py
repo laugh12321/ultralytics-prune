@@ -40,6 +40,7 @@ from ultralytics.utils import (
     colorstr,
     emojis,
 )
+from ultralytics.utils.loss import DistillationLoss
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
@@ -274,6 +275,21 @@ class BaseTrainer:
             iterative_steps=1,  # Fixed iterative steps for simplicity
         )
 
+        # Distillation
+        DISTILL_TYPE = ["mgd", "cwd", "pkd", "at", "mimic"]
+        self.teacher = None
+        self.distill = self.args.distill
+        self.args.amp = not self.distill
+        self.distill_layers = self.args.distill_layers
+        self.distill_type = self.args.distill_type.lower()
+        if self.distill_type not in DISTILL_TYPE:
+            raise ValueError(
+                f"Unsupported distill type: {self.distill_type}. Supported types: {', '.join(DISTILL_TYPE)}. "
+                f"Please check your configuration file or overrides."
+            )
+        if self.distill and self.prune:
+            raise ValueError("Distillation and pruning cannot be enabled at the same time.")
+
     def add_callback(self, event: str, callback):
         """Append the given callback to the event's callback list."""
         self.callbacks[event].append(callback)
@@ -404,6 +420,9 @@ class BaseTrainer:
         )
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+            if self.distill:
+                self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
+                self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -484,6 +503,11 @@ class BaseTrainer:
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
 
+            # Distillation setup
+            if self.distill:
+                self.teacher = self.teacher.to(self.device)
+                distill_loss = DistillationLoss(self.model, self.teacher, self.distill_layers, self.distill_type)
+
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
@@ -495,6 +519,9 @@ class BaseTrainer:
 
             if self.prune and self.prune_sparse:
                 self.pruner.update_regularizer()  # Init every epoch
+
+            if self.distill:
+                distill_loss.register_hooks()
 
             if RANK in {-1, 0}:
                 LOGGER.info(self.progress_string())
@@ -525,6 +552,13 @@ class BaseTrainer:
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
+
+                    if self.distill:
+                        distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                        with torch.no_grad():
+                            self.teacher(batch['img'])
+                        loss_distill = distill_loss.get_loss() * distill_weight
+                        self.loss += loss_distill
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
@@ -569,6 +603,8 @@ class BaseTrainer:
 
             if self.prune and isinstance(self.pruner, tp.pruner.GrowingRegPruner):
                 self.pruner.update_reg()  # increase the strength of regularization
+            if self.distill:
+                distill_loss.remove_hooks()
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")

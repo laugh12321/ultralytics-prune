@@ -767,6 +767,10 @@ class Model(torch.nn.Module):
                 prune_ratio (float): Ratio of parameters to prune.
                 prune_global (bool): Whether to apply pruning globally or per layer.
                 prune_sparse (bool): Whether to apply sparse training during pruning.
+                distill (bool): Whether to apply distillation during training.
+                distill_type (str): Type of distillation (e.g., 'mgd', 'cwd', 'pkd', 'at', 'mimic').
+                distill_layers (list[int]): Layers to apply distillation.
+                distill_teacher (str): Path to teacher model for distillation.
 
         Returns:
             (Dict | None): Training metrics if available and training is successful; otherwise, None.
@@ -798,8 +802,19 @@ class Model(torch.nn.Module):
 
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
         if not args.get("resume"):  # manually set model only if not resuming
-            self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
-            self.model = self.trainer.model
+            self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml, verbose=not (args.get("distill") or args.get("prune")))
+            if args.get("distill") or args.get("prune"):
+                # fix the failure of pruning and warnings
+                for k, v in self.model.named_parameters():
+                    if not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
+                        v.requires_grad = True
+                self.trainer.model = self.model # do not rebuild the model using yaml
+                self.model.info(detailed=True)
+            else:
+                self.model = self.trainer.model
+        # if distill is True and distill_teacher is not None
+        if args.get("distill") and args.get("distill_teacher"):
+            self.trainer.teacher, _ = attempt_load_one_weight(args["distill_teacher"])
 
         self.trainer.hub_session = self.session  # attach optional HUB session
         self.trainer.train()

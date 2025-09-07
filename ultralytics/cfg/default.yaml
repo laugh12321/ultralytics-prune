@@ -49,6 +49,11 @@ prune_method: GroupNorm # (str) pruning method, choices=[BNScale, GroupNorm, Gro
 prune_ratio: 0.5 # (float) pruning ratio, i.e. 0.5 for 50% pruning
 prune_global: False # (bool) prune globally across all layers
 prune_sparse: False # (bool) use sparse training during pruning
+# Distill
+distill: False # (bool) distill model during training, i.e. distill=True
+distill_type: mgd # (str) distillation type, choices=[mgd, cwd, pkd, at, mimic]
+distill_teacher: # (str) path to teacher model file, i.e. yolov8n.pt
+distill_layers: [6, 8, 13, 16, 19, 22] # (list[int]) layers to apply distillation
 
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) validate/test during training

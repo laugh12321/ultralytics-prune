@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -848,3 +848,426 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+
+class CWDLoss(nn.Module):
+    """PyTorch version of `Channel-wise Distillation for Semantic Segmentation.
+
+    <https://arxiv.org/abs/2011.13256>`_.
+
+    Args:
+        tau (float): Temperature coefficient. Defaults to 1.0.
+    """
+    def __init__(self, tau: float = 1.0):
+        super(CWDLoss, self).__init__()
+        self.tau = tau
+
+    def forward(self, preds_S: torch.Tensor, preds_T: torch.Tensor) -> torch.Tensor:
+        """Forward computation.
+
+        Args:
+            preds_S (torch.Tensor): The student model prediction with
+                shape (N, C, H, W).
+            preds_T (torch.Tensor): The teacher model prediction with
+                shape (N, C, H, W).
+
+        Return:
+            torch.Tensor: The calculated loss value.
+        """
+        assert preds_S.shape[-2:] == preds_T.shape[-2:]
+        N, C, H, W = preds_S.shape
+
+        softmax_pred_T = F.softmax(preds_T.view(-1, W * H) / self.tau, dim=1)
+
+        logsoftmax = torch.nn.LogSoftmax(dim=1)
+        loss = torch.sum(softmax_pred_T *
+                         logsoftmax(preds_T.view(-1, W * H) / self.tau) -
+                         softmax_pred_T *
+                         logsoftmax(preds_S.view(-1, W * H) / self.tau)) * (
+                             self.tau**2)
+
+        return loss / (C * N)
+
+
+class CWDLossList(nn.Module):
+    """Multi-scale wrapper for CWDLoss."""
+    def __init__(self, tau: float = 1.0):
+        super(CWDLossList, self).__init__()
+        self.cw = CWDLoss(tau)
+
+    def forward(self, preds_S: List[torch.Tensor], preds_T: List[torch.Tensor]) -> torch.Tensor:
+        assert len(preds_S) == len(preds_T)
+        return sum(self.cw(s, t) for s, t in zip(preds_S, preds_T))
+
+
+class MGDLoss(nn.Module):
+    """PyTorch version of `Masked Generative Distillation.
+
+    <https://arxiv.org/abs/2205.01529>`
+
+    Args:
+        alpha_mgd (float, optional): Weight of dis_loss. Defaults to 2e-5
+    """
+
+    def __init__(self, teacher_channel: int, lambda_mgd: float = 0.65, alpha_mgd: float = 2e-5):
+        super(MGDLoss, self).__init__()
+        self.alpha_mgd = alpha_mgd
+        self.lambda_mgd = lambda_mgd
+        self.loss_mse = nn.MSELoss(reduction='sum')
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.generation = nn.Sequential(
+            nn.Conv2d(teacher_channel, teacher_channel, kernel_size=3, padding=1).to(device),
+            nn.ReLU(inplace=True).to(device),
+            nn.Conv2d(teacher_channel, teacher_channel, kernel_size=3, padding=1).to(device)
+        )
+
+    def mask_perd_S(self, preds_S: torch.Tensor) -> torch.Tensor:
+        N, C, H, W = preds_S.shape
+
+        device = preds_S.device
+        mat = torch.rand((N, 1, H, W)).to(device)
+        mat = torch.where(mat > 1 - self.lambda_mgd,
+                          torch.zeros(1).to(device),
+                          torch.ones(1).to(device)).to(device)
+
+        masked_fea = torch.mul(preds_S, mat)
+        return self.generation(masked_fea)
+
+    def get_dis_loss(self, preds_S: torch.Tensor, preds_T: torch.Tensor) -> torch.Tensor:
+        """Get MSE distance of preds_S and preds_T.
+
+        Args:
+            preds_S (torch.Tensor): The student model prediction with
+                shape (N, C, H, W).
+            preds_T (torch.Tensor): The teacher model prediction with
+                shape (N, C, H, W).
+
+        Return:
+            torch.Tensor: The calculated mse distance value.
+        """
+        N, C, H, W = preds_T.shape
+        return self.loss_mse(preds_S, preds_T) / N
+
+    def forward(self, preds_S: torch.Tensor, preds_T: torch.Tensor) -> torch.Tensor:
+        """Forward function.
+
+        Args:
+            preds_S (torch.Tensor): The student model prediction with
+                shape (N, C, H, W).
+            preds_T (torch.Tensor): The teacher model prediction with
+                shape (N, C, H, W).
+
+        Return:
+            torch.Tensor: The calculated loss value.
+        """
+        assert preds_S.shape == preds_T.shape
+        mask_S = self.mask_perd_S(preds_S)
+        return self.get_dis_loss(mask_S, preds_T) * self.alpha_mgd
+
+
+class MGDLossList(nn.Module):
+    """Multi-scale wrapper for MGDLoss."""
+    def __init__(self, teacher_channels: List[int], lambda_mgd: float = 0.65, alpha_mgd: float = 2e-5):
+        super(MGDLossList, self).__init__()
+        self.losses = nn.ModuleList([
+            MGDLoss(ct, lambda_mgd, alpha_mgd)
+            for ct in teacher_channels
+        ])
+
+    def forward(self, preds_S: List[torch.Tensor], preds_T: List[torch.Tensor]) -> torch.Tensor:
+        assert len(preds_S) == len(preds_T) == len(self.losses)
+        return sum(l(s, t) for l, s, t in zip(self.losses, preds_S, preds_T))
+
+
+class PKDLoss(nn.Module):
+    """PyTorch version of `PKD: General Distillation Framework for Object
+    Detectors via Pearson Correlation Coefficient.
+
+    <https://arxiv.org/abs/2207.02039>`_.
+
+    Args:
+        resize_stu (bool): If True, we'll down/up sample the features of the
+            student model to the spatial size of those of the teacher model if
+            their spatial sizes are different. And vice versa. Defaults to
+            True.
+    """
+
+    def __init__(self, resize_stu: bool =True):
+        super(PKDLoss, self).__init__()
+        self.resize_stu = resize_stu
+
+    @staticmethod
+    def norm(feat: torch.Tensor) -> torch.Tensor:
+        """Normalize the feature maps to have zero mean and unit variances.
+
+        Args:
+            feat (torch.Tensor): The original feature map with shape
+                (N, C, H, W).
+        """
+        assert len(feat.shape) == 4
+        N, C, H, W = feat.shape
+        feat = feat.permute(1, 0, 2, 3).reshape(C, -1)
+        mean = feat.mean(dim=-1, keepdim=True)
+        std = feat.std(dim=-1, keepdim=True)
+        feat = (feat - mean) / (std + 1e-6)
+        return feat.reshape(C, N, H, W).permute(1, 0, 2, 3)
+
+    def forward(self, preds_S: Union[torch.Tensor, Tuple], preds_T: Union[torch.Tensor, Tuple]) -> torch.Tensor:
+        """Forward computation.
+
+        Args:
+            preds_S (torch.Tensor | Tuple[torch.Tensor]): The student model
+                prediction. If tuple, it should be several tensors with shape
+                (N, C, H, W).
+            preds_T (torch.Tensor | Tuple[torch.Tensor]): The teacher model
+                prediction. If tuple, it should be several tensors with shape
+                (N, C, H, W).
+
+        Return:
+            torch.Tensor: The calculated loss value.
+        """
+        if isinstance(preds_S, torch.Tensor):
+            preds_S, preds_T = (preds_S, ), (preds_T, )
+
+        loss = 0.0
+
+        for pred_S, pred_T in zip(preds_S, preds_T):
+            size_S, size_T = pred_S.shape[2:], pred_T.shape[2:]
+            if size_S[0] != size_T[0]:
+                if self.resize_stu:
+                    pred_S = F.interpolate(pred_S, size_T, mode='bilinear')
+                else:
+                    pred_T = F.interpolate(pred_T, size_S, mode='bilinear')
+            assert pred_S.shape == pred_T.shape
+
+            norm_S, norm_T = self.norm(pred_S), self.norm(pred_T)
+
+            # First conduct feature normalization and then calculate the
+            # MSE loss. Methematically, it is equivalent to firstly calculate
+            # the Pearson Correlation Coefficient (r) between two feature
+            # vectors, and then use 1-r as the new feature imitation loss.
+            loss += F.mse_loss(norm_S, norm_T) / 2
+
+        return loss
+
+
+class PKDLossList(nn.Module):
+    """Multi-scale wrapper for PKDLoss."""
+    def __init__(self, resize_stu: bool = True):
+        super(PKDLossList, self).__init__()
+        self.pk = PKDLoss(resize_stu)
+
+    def forward(self, preds_S: List[Union[torch.Tensor, Tuple]], preds_T: List[Union[torch.Tensor, Tuple]]) -> torch.Tensor:
+        assert len(preds_S) == len(preds_T)
+        return torch.stack([self.pk(s, t) for s, t in zip(preds_S, preds_T)]).mean()
+
+
+class ATLoss(nn.Module):
+    """ Attention Transfer (attention maps) — Zagoruyko & Komodakis 2017 """
+    def __init__(self, eps: float = 1e-6):
+        super(ATLoss, self).__init__()
+        self.eps = eps
+        
+    @staticmethod
+    def attention(features: torch.Tensor, eps: float) -> torch.Tensor:
+        att = features.pow(2).mean(1, keepdim=True)  # (N, 1, H, W)
+        att = att.flatten(2)  # (N, 1, H*W)
+        return att / (att.norm(p=2, dim=2, keepdim=True) + eps)  # (N, 1, H*W)
+
+    def forward(self, preds_S: List[torch.Tensor], preds_T: List[torch.Tensor]) -> torch.Tensor:
+        assert len(preds_S) == len(preds_T)
+        losses = []
+        for s, t in zip(preds_S, preds_T):
+            As = self.attention(s, self.eps)
+            At = self.attention(t, self.eps)
+            losses.append(F.mse_loss(As, At, reduction='mean'))
+        return sum(losses)
+
+
+class MimicLoss(nn.Module):
+    """ Feature Map Mimic Loss — Hinton et al. 2015 """
+    def __init__(self):
+        super(MimicLoss, self).__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, preds_S: List[torch.Tensor], preds_T: List[torch.Tensor]) -> torch.Tensor:
+        assert len(preds_S) == len(preds_T)
+        losses = []
+        for s, t in zip(preds_S, preds_T):
+            assert s.shape == t.shape
+            losses.append(self.mse(s, t))
+        return sum(losses)
+
+
+class FeatureLoss(nn.Module):
+    """
+    A module for calculating feature distillation loss.
+
+    This module aligns student and teacher features, normalizes them, and then computes the distillation loss.
+    """
+
+    def __init__(self, channels_s: List[int], channels_t: List[int], distiller: str = 'cwd') -> None:
+        """
+        Initialize the FeatureLoss module.
+
+        Args:
+            channels_s (List[int]): List of output channel numbers for student model layers.
+            channels_t (List[int]): List of output channel numbers for teacher model layers.
+            distiller (str, optional): Type of distillation loss function, options are 'mimic', 'at', 'pkd', mgd' or 'cwd'. Defaults to 'cwd'.
+        """
+        super(FeatureLoss, self).__init__()
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # 1. Alignment: Create convolution layers only when channel numbers are inconsistent, otherwise use Identity
+        self.align_module = nn.ModuleList([
+            nn.Conv2d(cs, ct, 1).to(device) if cs != ct else nn.Identity()
+            for cs, ct in zip(channels_s, channels_t)
+        ])
+        # 2. Normalization: Set affine to False
+        self.bn_module = nn.ModuleList([
+            nn.BatchNorm2d(ct, affine=False).to(device) for ct in channels_t
+        ])
+        # 3. Distillation loss
+        self.feature_loss = {
+            'mgd': MGDLossList(channels_t),   # Default lambda_mgd=0.65, alpha_mgd=2e-5
+            'cwd': CWDLossList(),             # Default tau=1.0
+            'pkd': PKDLossList(),             # Default resize_stu=True
+            'at': ATLoss(),                   # Default eps=1e-6
+            'mimic': MimicLoss(),
+        }[distiller]
+
+    def forward(self, y_s: List[torch.Tensor], y_t: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute the feature distillation loss.
+
+        Args:
+            y_s (List[torch.Tensor]): List of student model features.
+            y_t (List[torch.Tensor]): List of teacher model features.
+
+        Returns:
+            torch.Tensor: Calculated feature distillation loss.
+        """
+        assert len(y_s) == len(y_t)
+        stu_feats, tea_feats = [], []
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            # Use the device of the input tensor, no need for additional .to()
+            s = self.bn_module[idx](self.align_module[idx](s))
+            t = self.bn_module[idx](t)
+            stu_feats.append(s)
+            tea_feats.append(t.detach())
+        return self.feature_loss(stu_feats, tea_feats)
+
+
+class DistillationLoss:
+    """
+    A class for calculating the distillation loss between student and teacher models.
+
+    This class uses forward hooks to capture features from specified layers of student and teacher models,
+    and then computes the distillation loss.
+    """
+
+    def __init__(self, model_s: nn.Module, model_t: nn.Module, layers: List[int], distiller: str) -> None:
+        """
+        Initialize the DistillationLoss module.
+
+        Args:
+            model_s (nn.Module): Student model.
+            model_t (nn.Module): Teacher model.
+            layers (List[int]): List of layer indices to extract features from.
+            distiller (str): Type of distillation loss function, options are 'mimic', 'at', 'pkd', 'mgd' or 'cwd'.
+        """
+        # Extract channel numbers
+        channels_s, self.modules_s = self.extract_channels_and_modules(model_s, layers)
+        channels_t, self.modules_t = self.extract_channels_and_modules(model_t, layers)
+
+        # Distillation loss
+        self.loss_fn = FeatureLoss(
+            channels_s=channels_s,
+            channels_t=channels_t,
+            distiller=distiller,  # mimic / at / pkg / cwd / mgd
+        )
+
+        # Hook cache
+        self.handles: List[torch.utils.hooks.RemovableHandle] = []
+        self.s_feats: List[torch.Tensor] = []
+        self.t_feats: List[torch.Tensor] = []
+
+    @staticmethod
+    def extract_channels_and_modules(model: nn.Module, layers: List[int]):
+        """
+        Extract channel numbers and modules from the specified layers of the model.
+
+        Args:
+            model (nn.Module): Model to extract channel numbers from.
+            layers (List[int]): List of layer indices to extract features from.
+
+        Returns:
+            tuple: A tuple containing the list of channel numbers and the list of modules.
+        """
+        channels = []
+        modules = []
+        for name, ml in model.named_modules():
+            name = name.split(".")
+            if name[0] == "module":
+                name.pop(0)
+            if name[0] != "model":
+                continue
+            if len(name) >= 3 and int(name[1]) in layers:
+                if "cv2" in name[2]:
+                    if hasattr(ml, 'conv'):
+                        channels.append(ml.conv.out_channels)
+                        modules.append(ml)
+
+        return channels, modules
+
+    @staticmethod
+    def _hook_fn(buffer: list, detach: bool):
+        """
+        Generate a forward hook function.
+
+        Args:
+            buffer (list): Buffer to store the output features.
+            detach (bool): Whether to detach the output tensor to cut off the gradient flow.
+
+        Returns:
+            callable: Forward hook function.
+        """
+        def _hook(module, inp, outp):
+            if isinstance(outp, torch.Tensor):
+                buffer.append(outp.detach().clone() if detach else outp.clone())
+            else:
+                buffer.append([o.detach().clone() if detach and isinstance(o, torch.Tensor) else
+                               o.clone() if isinstance(o, torch.Tensor) else o for o in outp])
+        return _hook
+
+    def register_hooks(self) -> None:
+        """
+        Register forward hooks. If called repeatedly, old hooks will be removed first.
+        """
+        self.remove_hooks()
+        for m_s, m_t in zip(self.modules_s, self.modules_t):
+            self.handles += [
+                m_s.register_forward_hook(self._hook_fn(self.s_feats, detach=False)),
+                m_t.register_forward_hook(self._hook_fn(self.t_feats, detach=True)),
+            ]
+
+    def get_loss(self) -> torch.Tensor:
+        """
+        Calculate the distillation loss. Return 0 if the feature lists are empty.
+
+        Returns:
+            torch.Tensor: Calculated distillation loss.
+        """
+        assert len(self.s_feats) == len(self.t_feats), "Feature output mismatch"
+
+        loss = self.loss_fn(self.s_feats, self.t_feats)
+        self.s_feats.clear()
+        self.t_feats.clear()
+        return loss
+
+    def remove_hooks(self) -> None:
+        """
+        Remove all registered hooks.
+        """
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
